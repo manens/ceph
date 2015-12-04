@@ -178,7 +178,6 @@ public:
 
 void ReplicatedPG::on_local_recover(
   const hobject_t &hoid,
-  const object_stat_sum_t &stat_diff,
   const ObjectRecoveryInfo &_recovery_info,
   ObjectContextRef obc,
   ObjectStore::Transaction *t
@@ -227,8 +226,6 @@ void ReplicatedPG::on_local_recover(
   recover_got(recovery_info.soid, recovery_info.version);
 
   if (is_primary()) {
-    info.stats.stats.sum.add(stat_diff);
-
     assert(obc);
     obc->obs.exists = true;
     obc->ondisk_write_lock();
@@ -276,8 +273,10 @@ void ReplicatedPG::on_local_recover(
 }
 
 void ReplicatedPG::on_global_recover(
-  const hobject_t &soid)
+  const hobject_t &soid,
+  const object_stat_sum_t &stat_diff)
 {
+  info.stats.stats.sum.add(stat_diff);
   missing_loc.recovered(soid);
   publish_stats_to_osd();
   dout(10) << "pushed " << soid << " to all replicas" << dendl;
@@ -2264,33 +2263,29 @@ bool ReplicatedPG::maybe_promote(ObjectContextRef obc,
     }
     break;
   default:
-    if (in_hit_set) {
-      promote_object(obc, missing_oid, oloc, promote_op);
-    } else {
-      // Check if in other hit sets
-      map<time_t,HitSetRef>::iterator itor;
-      bool in_other_hit_sets = false;
-      unsigned max_in_memory_read = pool.info.min_read_recency_for_promote > 0 ? pool.info.min_read_recency_for_promote - 1 : 0;
-      unsigned max_in_memory_write = pool.info.min_write_recency_for_promote > 0 ? pool.info.min_write_recency_for_promote - 1 : 0;
-      unsigned max_in_memory = MAX(max_in_memory_read, max_in_memory_write);
-      for (itor = agent_state->hit_set_map.begin(); itor != agent_state->hit_set_map.end() && max_in_memory--; ++itor) {
-        if (obc.get()) {
-          if (obc->obs.oi.soid != hobject_t() && itor->second->contains(obc->obs.oi.soid)) {
-            in_other_hit_sets = true;
-            break;
-          }
-        } else {
-          if (missing_oid != hobject_t() && itor->second->contains(missing_oid)) {
-            in_other_hit_sets = true;
-            break;
-          }
-        }
+    {
+      unsigned count = (int)in_hit_set;
+      if (count) {
+	// Check if in other hit sets
+	const hobject_t& oid = obc.get() ? obc->obs.oi.soid : missing_oid;
+	for (map<time_t,HitSetRef>::reverse_iterator itor =
+	       agent_state->hit_set_map.rbegin();
+	     itor != agent_state->hit_set_map.rend();
+	     ++itor) {
+	  if (!itor->second->contains(oid)) {
+	    break;
+	  }
+	  ++count;
+	  if (count >= recency) {
+	    break;
+	  }
+	}
       }
-      if (in_other_hit_sets) {
-        promote_object(obc, missing_oid, oloc, promote_op);
+      if (count >= recency) {
+	promote_object(obc, missing_oid, oloc, promote_op);
       } else {
 	// not promoting
-        return false;
+	return false;
       }
     }
     break;
